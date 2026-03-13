@@ -3,17 +3,17 @@
 #
 # --- BEGIN_HEADER ---
 #
-# generate_dirty_blockmap_patch.sh
-# Copyright (C) 2026  The lustrebackup Project by the Science HPC Center at UCPH
+# generate_dirty_blockmap_patch.sh - lustre-dirty-blockmap
+# Copyright (C) 2026  The Science HPC Center at UCPH
 #
-# This file is part of lustrebackup.
+# This file is part of lustre-dirty-blockmap.
 #
-# MiG is free software: you can redistribute it and/or modify
+# lustre-dirty-blockmap is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
 #
-# MiG is distributed in the hope that it will be useful,
+# lustre-dirty-blockmap is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
@@ -42,9 +42,18 @@
 # Implementation notes (2.15.8 specific):
 #   - lli->lli_lock is rwlock_t; use write_lock/write_unlock
 #   - xattr I/O buffers are heap-allocated (64 KB exceeds kernel stack limit)
-#   - d_find_alias()/dput() used to obtain dentry for ll_vfs_setxattr/getxattr
-#   - Bitmap init in ll_file_open placed before final GOTO(out_och_free) on
-#     the success path (inserting before the label itself lands in dead code)
+#   - Fresh bitmap allocated at open if file >= 2GB, otherwise lazily
+#     on first write where either ki_pos >= 2GB or i_size_read() >= 2GB
+#     (handles both growing files and writes into large sparse files)
+#   - At close/fsync/write-commit: simple read-OR-write of xattr (no
+#     distributed lock — Lustre has no client-side LCK_EX for
+#     MDS_INODELOCK_XATTR; IT_SETXATTR is obsolete). A narrow TOCTOU
+#     race exists when two nodes flush concurrently; consequence is a
+#     missed dirty block, not data corruption.
+#   - Periodic flush in vvp_io_rw_end (CIT_WRITE only) mirrors mtime
+#     update cadence — bitmap survives long-running open files
+#   - dbm_dirty flag prevents unnecessary MDS RPCs when no new 2 GB
+#     blocks have been written since the last flush
 #   - ll_file_write_iter uses rc_normal; write start = ki_pos - rc_normal
 #     because ki_pos has already advanced by the time we hook it
 #
@@ -98,8 +107,7 @@ git checkout -b "$BRANCH" 2>/dev/null || {
 #   ll_dirty_blockmap_alloc  — allocate in-memory bitmap for an inode
 #   ll_dirty_blockmap_free   — free bitmap and clear lli->lli_dirty_blockmap
 #   ll_dirty_blockmap_mark   — set bits for a written byte range
-#   ll_dirty_blockmap_store  — persist bitmap to xattr (no-op if not dirty)
-#   ll_dirty_blockmap_load   — restore bitmap from xattr on open
+#   ll_dirty_blockmap_store  — read-OR-write xattr (no distributed lock)
 # =============================================================================
 cat > lustre/llite/dirty_blockmap.c << 'CEOF'
 // SPDX-License-Identifier: GPL-2.0
@@ -119,7 +127,8 @@ cat > lustre/llite/dirty_blockmap.c << 'CEOF'
  *
  * Track which 2 GB-aligned blocks have been written for large Lustre files.
  * The bitmap is persisted as the xattr "user.dirty_blockmap" — a raw array
- * of little-endian __u64 words with no header — and restored on first open.
+ * of little-endian __u64 words with no header — and merged into the MDS xattr
+ * at write commit, fsync and close via a simple read-OR-write sequence.
  *
  * Constraints:
  *   file size < DIRTY_BLOCKMAP_MIN_FILESIZE (2 GB)  ->  no bitmap (NULL)
@@ -149,7 +158,7 @@ cat > lustre/llite/dirty_blockmap.c << 'CEOF'
  *             dbm_nwords is sized correctly even before i_size is updated.
  *
  * Returns:
- *   valid ptr  success — call ll_dirty_blockmap_load() to restore persisted state
+ *   valid ptr  success — bitmap ready, starts zeroed (no xattr load)
  *   NULL       effective size < DIRTY_BLOCKMAP_MIN_FILESIZE; no bitmap needed
  *   ERR_PTR()  -ENOMEM or -EFBIG (effective size > 1 PB)
  */
@@ -262,32 +271,42 @@ void ll_dirty_blockmap_mark(struct ll_dirty_blockmap *bm, loff_t pos, size_t len
 }
 
 /**
- * ll_dirty_blockmap_store() - Persist bitmap to the "user.dirty_blockmap" xattr.
- * @inode: inode whose xattr will be written
- * @bm:    dirty_blockmap to persist
+ * ll_dirty_blockmap_merge_xattr() - Read existing xattr, OR with local bitmap,
+ *                                   write result back to MDS.
+ * @inode: inode whose xattr will be updated
+ * @bm:    local dirty_blockmap to merge
  *
- * No-op when dbm_dirty is false. Words are stored little-endian for
- * portability. Uses heap allocation to avoid kernel stack overflow
- * (the full bitmap is 64 KB).
+ * Called from ll_dirty_blockmap_store() when dbm_dirty is true.
+ *
+ * Concurrency note:
+ *   This is a read-modify-write sequence with no distributed lock protecting
+ *   it. Two nodes performing this sequence concurrently — whether at close()
+ *   or at write commit — can race: both read the same xattr, both OR in their
+ *   local bits, and the last writer wins, potentially losing the other node's
+ *   bits. With 2 GB block granularity this window is very narrow in practice,
+ *   the consequence is a missed dirty block no data corruption or data loss.
+ *
+ *   A proper fix would require an atomic OR operation on the MDS side, which
+ *   is not possible with client-only changes. Lustre has no client-side
+ *   LCK_EX path for MDS_INODELOCK_XATTR — IT_SETXATTR is obsolete and ACL
+ *   consistency relies on MDS-side serialization, not client-side locking.
  *
  * Returns 0 on success, negative errno on failure.
  */
-int ll_dirty_blockmap_store(struct inode *inode, struct ll_dirty_blockmap *bm)
+static int ll_dirty_blockmap_merge_xattr(struct inode *inode,
+					 struct ll_dirty_blockmap *bm)
 {
-	struct dentry	*dentry;
-	__u64		*buf;
-	__u32		 nwords;
-	__u32		 i;
-	size_t		 xattr_size;
-	int		 rc;
+	struct ll_sb_info	*sbi = ll_i2sbi(inode);
+	struct ptlrpc_request	*req = NULL;
+	__u64			*buf;
+	__u32			 nwords;
+	__u32			 i;
+	size_t			 xattr_size;
+	ssize_t			 rc;
 
 	ENTRY;
 
 	spin_lock(&bm->dbm_lock);
-	if (!bm->dbm_dirty) {
-		spin_unlock(&bm->dbm_lock);
-		RETURN(0);
-	}
 	nwords = bm->dbm_nwords;
 	spin_unlock(&bm->dbm_lock);
 
@@ -296,105 +315,70 @@ int ll_dirty_blockmap_store(struct inode *inode, struct ll_dirty_blockmap *bm)
 	if (!buf)
 		RETURN(-ENOMEM);
 
+	/* Step 1: read current xattr from MDS.
+	 * -ENODATA means no xattr yet — buf stays zeroed, which is correct. */
+	rc = ll_xattr_list(inode, DIRTY_BLOCKMAP_XATTR_NAME,
+			   XATTR_USER_T, buf, xattr_size, OBD_MD_FLXATTR);
+	if (rc < 0 && rc != -ENODATA) {
+		CERROR(DFID " failed to read dirty_blockmap xattr: rc=%zd\n",
+		       PFID(ll_inode2fid(inode)), rc);
+		OBD_FREE(buf, xattr_size);
+		RETURN((int)rc);
+	}
+
+	/* Step 2: OR existing bits with our local dirty bits (little-endian) */
 	spin_lock(&bm->dbm_lock);
 	for (i = 0; i < nwords; i++)
-		buf[i] = cpu_to_le64(bm->dbm_words[i]);
+		buf[i] = cpu_to_le64(le64_to_cpu(buf[i]) | bm->dbm_words[i]);
 	bm->dbm_dirty = false;
 	spin_unlock(&bm->dbm_lock);
 
-	dentry = d_find_alias(inode);
-	if (!dentry) {
-		OBD_FREE(buf, xattr_size);
-		RETURN(-ENOENT);
-	}
-	rc = ll_vfs_setxattr(dentry, inode,
-			     DIRTY_BLOCKMAP_XATTR_NAME, buf, xattr_size, 0);
-	dput(dentry);
-
+	/* Step 3: write merged bitmap back to MDS.
+	 * flags=0 means unconditional upsert (create if absent, replace if
+	 * present). */
+	rc = md_setxattr(sbi->ll_md_exp, ll_inode2fid(inode),
+			 OBD_MD_FLXATTR, DIRTY_BLOCKMAP_XATTR_NAME,
+			 buf, xattr_size, 0,
+			 ll_i2suppgid(inode), &req);
+	ptlrpc_req_finished(req);
 	if (rc)
-		CERROR(DFID " failed to store dirty_blockmap xattr: rc=%d\n",
+		CERROR(DFID " failed to store dirty_blockmap xattr: rc=%zd\n",
 		       PFID(ll_inode2fid(inode)), rc);
 
 	OBD_FREE(buf, xattr_size);
-	RETURN(rc);
+	RETURN((int)rc);
 }
 
 /**
- * ll_dirty_blockmap_load() - Restore bitmap from the "user.dirty_blockmap" xattr.
- * @inode: inode to read the xattr from
- * @bm:    dirty_blockmap structure to populate
+ * ll_dirty_blockmap_store() - Persist bitmap to the "user.dirty_blockmap" xattr.
+ * @inode: inode whose xattr will be written
+ * @bm:    dirty_blockmap to persist; no-op if NULL or not dirty
  *
- * ENODATA means the file has never been tracked — treated as clean slate.
- * Uses heap allocation to avoid kernel stack overflow.
+ * Always starts with a fresh local bitmap (allocated at open if file is
+ * already >= 2GB, or lazily on first write past 2GB) and merges it into the
+ * persistent xattr at close/fsync/write-commit time. See
+ * ll_dirty_blockmap_merge_xattr() for concurrency notes.
  *
- * Returns 0 on success (including ENODATA), negative errno on error.
+ * Returns 0 on success, negative errno on failure.
  */
-int ll_dirty_blockmap_load(struct inode *inode, struct ll_dirty_blockmap *bm)
+int ll_dirty_blockmap_store(struct inode *inode, struct ll_dirty_blockmap *bm)
 {
-	struct dentry	*dentry;
-	__u64		*buf;
-	ssize_t		 rc;
-	__u32		 nwords;
-	__u32		 i;
-
+	int rc;
 	ENTRY;
 
-	OBD_ALLOC(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
-	if (!buf)
-		RETURN(-ENOMEM);
-
-	dentry = d_find_alias(inode);
-	if (!dentry) {
-		OBD_FREE(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
-		RETURN(-ENOENT);
-	}
-	rc = ll_vfs_getxattr(dentry, inode,
-			     DIRTY_BLOCKMAP_XATTR_NAME, buf,
-			     DIRTY_BLOCKMAP_XATTR_BYTES);
-	dput(dentry);
-
-	if (rc == -ENODATA) {
-		/* File never tracked before — start with clean bitmap */
-		CDEBUG(D_INODE,
-		       DFID " no dirty_blockmap xattr, starting fresh\n",
-		       PFID(ll_inode2fid(inode)));
-		OBD_FREE(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
+	/* Nothing to merge if no bitmap was allocated for this open */
+	if (!bm)
 		RETURN(0);
-	}
-	if (rc < 0) {
-		CERROR(DFID " failed to load dirty_blockmap xattr: rc=%zd\n",
-		       PFID(ll_inode2fid(inode)), rc);
-		OBD_FREE(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
-		RETURN((int)rc);
-	}
-	if (rc % (ssize_t)sizeof(__u64) != 0) {
-		CERROR(DFID " dirty_blockmap xattr size %zd not a multiple of 8\n",
-		       PFID(ll_inode2fid(inode)), rc);
-		OBD_FREE(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
-		RETURN(-EINVAL);
-	}
-
-	nwords = (__u32)(rc / (ssize_t)sizeof(__u64));
-	if (nwords > DIRTY_BLOCKMAP_MAX_WORDS) {
-		CERROR(DFID " dirty_blockmap xattr has %u words, max is %lu\n",
-		       PFID(ll_inode2fid(inode)), nwords,
-		       (unsigned long)DIRTY_BLOCKMAP_MAX_WORDS);
-		OBD_FREE(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
-		RETURN(-EINVAL);
-	}
 
 	spin_lock(&bm->dbm_lock);
-	bm->dbm_nwords = nwords;
-	for (i = 0; i < nwords; i++)
-		bm->dbm_words[i] = le64_to_cpu(buf[i]);
-	bm->dbm_dirty = false;
+	if (!bm->dbm_dirty) {
+		spin_unlock(&bm->dbm_lock);
+		RETURN(0);
+	}
 	spin_unlock(&bm->dbm_lock);
 
-	CDEBUG(D_INODE, DFID " dirty_blockmap loaded: %u words\n",
-	       PFID(ll_inode2fid(inode)), nwords);
-
-	OBD_FREE(buf, DIRTY_BLOCKMAP_XATTR_BYTES);
-	RETURN(0);
+	rc = ll_dirty_blockmap_merge_xattr(inode, bm);
+	RETURN(rc);
 }
 CEOF
 
@@ -495,8 +479,6 @@ DEFS = (
     "\t\t\t\t\t\t loff_t pos, size_t len);\n"
     "int\t\t\t  ll_dirty_blockmap_store(struct inode *inode,\n"
     "\t\t\t\t\t\t  struct ll_dirty_blockmap *bm);\n"
-    "int\t\t\t  ll_dirty_blockmap_load(struct inode *inode,\n"
-    "\t\t\t\t\t\t struct ll_dirty_blockmap *bm);\n"
     "\n"
 )
 
@@ -518,9 +500,9 @@ print("llite_internal.h OK")
 # lustre/llite/file.c
 #
 # Changes:
-#   1. ll_file_open: declare 'bm' variable; allocate+load bitmap before the
-#      final GOTO(out_och_free) on the success path
-#   2. ll_file_write_iter: mark written blocks before RETURN(rc_normal)
+#   1. ll_file_open: declare 'bm' variable; allocate fresh bitmap if file
+#      is already >= 2GB at open time (smaller files handled lazily)
+#   2. ll_file_write_iter: lazy alloc + mark written blocks before RETURN(rc_normal)
 #   3. ll_fsync: persist bitmap to xattr before returning
 # ══════════════════════════════════════════════════════════════════════════════
 path = 'lustre/llite/file.c'
@@ -551,9 +533,14 @@ idx_insert = idx_goto if idx_goto != -1 else idx_label
 
 lines = splice(lines, idx_insert,
     "\t/*\n"
-    "\t * dirty_blockmap: allocate and load for qualifying regular files\n"
-    "\t * on first open. Persisted state is restored from xattr here.\n"
-    "\t * Only initialised once; lli_dirty_blockmap persists across re-opens.\n"
+    "\t * dirty_blockmap: if the file is already >= 2GB at open time,\n"
+    "\t * allocate a fresh zeroed bitmap now. For files that are smaller\n"
+    "\t * at open, the bitmap is allocated lazily in ll_file_write_iter\n"
+    "\t * on the first write that crosses the 2GB threshold.\n"
+    "\t * We never load the existing xattr here — the persistent xattr\n"
+    "\t * is merged at close/fsync/write-commit via read-OR-write.\n"
+    "\t * A narrow TOCTOU race exists on concurrent flushes from multiple\n"
+    "\t * nodes; consequence is a missed dirty block, not data corruption.\n"
     "\t */\n"
     "\tif (!lli->lli_dirty_blockmap) {\n"
     "\t\tbm = ll_dirty_blockmap_alloc(inode, 0);\n"
@@ -562,7 +549,6 @@ lines = splice(lines, idx_insert,
     "\t\t\t       \"dirty_blockmap_alloc failed rc=%ld, skipping\\n\",\n"
     "\t\t\t       PTR_ERR(bm));\n"
     "\t\t} else if (bm) {\n"
-    "\t\t\tll_dirty_blockmap_load(inode, bm);\n"
     "\t\t\tlli->lli_dirty_blockmap = bm;\n"
     "\t\t}\n"
     "\t\t/* bm == NULL: file < 2 GB, silently skip */\n"
@@ -606,19 +592,19 @@ else:
         "\n"
         "\t\t/*\n"
         "\t\t * Lazy bitmap allocation: files opened when small (e.g. via\n"
-        "\t\t * dd O_TRUNC) have no bitmap yet. iocb->ki_pos has already\n"
-        "\t\t * advanced to the end of this write — use it to detect when\n"
-        "\t\t * the file has grown past DIRTY_BLOCKMAP_MIN_FILESIZE.\n"
+        "\t\t * dd O_TRUNC) have no bitmap yet. Allocate when either:\n"
+        "\t\t *  - iocb->ki_pos crossed 2GB (file grew past threshold), or\n"
+        "\t\t *  - i_size_read() >= 2GB (write anywhere in a large sparse\n"
+        "\t\t *    file that was already large at write time)\n"
         "\t\t */\n"
         "\t\tif (!_lli->lli_dirty_blockmap &&\n"
-        "\t\t    iocb->ki_pos >= (loff_t)DIRTY_BLOCKMAP_MIN_FILESIZE) {\n"
+        "\t\t    (iocb->ki_pos >= (loff_t)DIRTY_BLOCKMAP_MIN_FILESIZE ||\n"
+        "\t\t     i_size_read(_inode) >= (loff_t)DIRTY_BLOCKMAP_MIN_FILESIZE)) {\n"
         "\t\t\tstruct ll_dirty_blockmap *_bm =\n"
         "\t\t\t\tll_dirty_blockmap_alloc(_inode, iocb->ki_pos);\n"
         "\n"
-        "\t\t\tif (!IS_ERR_OR_NULL(_bm)) {\n"
-        "\t\t\t\tll_dirty_blockmap_load(_inode, _bm);\n"
+        "\t\t\tif (!IS_ERR_OR_NULL(_bm))\n"
         "\t\t\t\t_lli->lli_dirty_blockmap = _bm;\n"
-        "\t\t\t}\n"
         "\t\t}\n"
         "\n"
         "\t\tif (_lli->lli_dirty_blockmap)\n"
@@ -742,6 +728,57 @@ print("llite_lib.c OK")
 # lustre/llite/Makefile.in
 #
 # Change: append dirty_blockmap.o to the last lustre-objs assignment.
+# ══════════════════════════════════════════════════════════════════════════════
+# lustre/llite/vvp_io.c
+#
+# Change: flush bitmap in vvp_io_rw_end after each write IO completes.
+# This gives periodic persistence while the file is open (same cadence as
+# mtime updates), so a long-running writer survives crashes with recent
+# dirty block information in the xattr.
+#
+# vvp_io_rw_end is shared between CIT_READ and CIT_WRITE — guard on
+# CIT_WRITE so we don't fire on reads.
+#
+# dbm_dirty is checked inside ll_dirty_blockmap_store so this is a no-op
+# if no new 2 GB blocks have been written since the last flush.
+# ══════════════════════════════════════════════════════════════════════════════
+path = 'lustre/llite/vvp_io.c'
+lines = read(path)
+
+idx_rw_end = find_line(lines,
+    [r'^static void vvp_io_rw_end\b'],
+    label='vvp_io_rw_end')
+idx_rw_brace = find_line(lines, r'^\{', start=idx_rw_end,
+                         label='vvp_io_rw_end opening brace')
+idx_rw_close = find_line(lines, r'^\}', start=idx_rw_brace + 1,
+                         label='vvp_io_rw_end closing brace')
+
+lines = splice(lines, idx_rw_close,
+    "\n"
+    "\t/*\n"
+    "\t * Flush dirty-block bitmap to xattr after each write IO completes.\n"
+    "\t * This mirrors the mtime update cadence — the bitmap stays current\n"
+    "\t * even when the file is kept open for a long time.\n"
+    "\t * dbm_dirty is checked inside ll_dirty_blockmap_store, so this is\n"
+    "\t * a no-op if no new 2 GB blocks were dirtied since the last flush.\n"
+    "\t */\n"
+    "\tif (ios->cis_io->ci_type == CIT_WRITE &&\n"
+    "\t    lli->lli_dirty_blockmap) {\n"
+    "\t\tint _bm_rc = ll_dirty_blockmap_store(inode,\n"
+    "\t\t\t\t\t\t     lli->lli_dirty_blockmap);\n"
+    "\t\tif (_bm_rc)\n"
+    "\t\t\tCDEBUG(D_INODE,\n"
+    "\t\t\t       \"dirty_blockmap store on write end failed: rc=%d\\n\",\n"
+    "\t\t\t       _bm_rc);\n"
+    "\t}\n")
+
+write(path, lines)
+print("vvp_io.c OK")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# lustre/llite/Makefile.in
+#
+# Change: append dirty_blockmap.o to the last lustre-objs assignment.
 # In 2.15.8 Makefile.in uses Kbuild-style object lists:
 #   lustre-objs := dcache.o dir.o ...
 #   lustre-objs += ...
@@ -781,14 +818,13 @@ PYEOF
 # =============================================================================
 # 3. Commit and generate the patch
 # =============================================================================
-git add lustre/llite/
+git add lustre/llite/ lustre/llite/vvp_io.c
 
 git commit -m "llite: add 2GB block dirty bitmap via user.dirty_blockmap xattr
 
 Track which 2 GB-aligned blocks have been written for large files
-(>= 2 GB, <= 1 PB) by maintaining an in-memory bitmap persisted to/from
-the xattr 'user.dirty_blockmap' on fsync and inode eviction, and restored
-from xattr on first open of a qualifying file.
+(>= 2 GB, <= 1 PB) by maintaining an in-memory bitmap persisted to
+the xattr 'user.dirty_blockmap' on write commit, fsync and close.
 
 Design constraints:
   - Block size:     2 GB  (static, power-of-2)
@@ -798,30 +834,46 @@ Design constraints:
   - Bitmap:         8,192 x __u64 = 64 KB  (fits in one xattr value)
 
 xattr payload: raw little-endian __u64 array, no header.
-Block size and granularity are compile-time constants so no metadata
-needs to be embedded in the xattr value itself.
+
+Concurrency model:
+  Always starts with a fresh zeroed local bitmap (allocated at open if
+  the file is already >= 2GB, or lazily on the first write past 2GB)
+  and merges it into the persistent xattr at close/fsync/write-commit
+  time via a simple read-OR-write sequence (ll_xattr_list + md_setxattr).
+
+  No distributed lock is held around the read-modify-write — Lustre has
+  no client-side LCK_EX path for MDS_INODELOCK_XATTR (IT_SETXATTR is
+  obsolete; ACL consistency relies on MDS-side serialization). A narrow
+  TOCTOU race exists when two nodes flush concurrently at close() or
+  write commit: both may read the same xattr and the last writer wins,
+  potentially losing the other node's bits. With 2 GB block granularity
+  this window is very narrow. The consequence is a missed dirty block
+  not data corruption or data loss.
 
 Implementation notes (Lustre 2.15.8 specific):
   - lli->lli_lock is rwlock_t; use write_lock/write_unlock in
     ll_dirty_blockmap_free()
   - xattr I/O buffers are heap-allocated via OBD_ALLOC/OBD_FREE to avoid
     kernel stack overflow (the full bitmap is 64 KB)
-  - d_find_alias()/dput() used to obtain a dentry for ll_vfs_setxattr/
-    ll_vfs_getxattr (which require a dentry, not just an inode)
-  - Bitmap init in ll_file_open() is placed before the final
-    GOTO(out_och_free, rc) on the success path; inserting before the
-    label itself would land in dead code
+  - md_setxattr() requires ptlrpc_request** — always pass &req and call
+    ptlrpc_req_finished(req) to free the MDS reply buffer
   - ll_file_write_iter() uses rc_normal (not result); write start offset
     is iocb->ki_pos - rc_normal because ki_pos has already advanced
   - Lazy allocation in ll_file_write_iter(): files opened when small
-    (e.g. dd with O_TRUNC) get no bitmap at open time; the bitmap is
-    allocated on the first write after the file exceeds 2 GB
+    (e.g. dd with O_TRUNC) get no bitmap at open time; allocated on the
+    first write where ki_pos >= 2GB or i_size_read() >= 2GB (the latter
+    handles writes at low offsets into large sparse files)
+  - Periodic flush in vvp_io_rw_end (CIT_WRITE) mirrors mtime update
+    cadence — bitmap stays current during long-running open files
+  - dbm_dirty flag ensures flush is a no-op if no new 2 GB blocks
+    were written since the last flush — negligible MDS overhead
 
 Files modified:
   lustre/llite/llite_internal.h   constants, struct ll_dirty_blockmap,
                                    lli_dirty_blockmap field, declarations
   lustre/llite/dirty_blockmap.c   new file — all bitmap logic
-  lustre/llite/file.c             open / write_iter / fsync hooks
+  lustre/llite/file.c             open / write_iter / fsync / release hooks
+  lustre/llite/vvp_io.c           periodic flush in vvp_io_rw_end
   lustre/llite/llite_lib.c        persist + free on inode eviction
   lustre/llite/Makefile.in        add dirty_blockmap.o to kernel module
 

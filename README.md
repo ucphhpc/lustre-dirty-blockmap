@@ -43,6 +43,7 @@ least once. Block numbering starts at 0 (file bytes 0–2 GB).
 | `lustre/llite/dirty_blockmap.c` | **New file** — all bitmap logic |
 | `lustre/llite/llite_internal.h` | Constants, `struct ll_dirty_blockmap`, `lli_dirty_blockmap` field, declarations |
 | `lustre/llite/file.c` | Hooks in `ll_file_open`, `ll_file_write_iter`, `ll_file_release`, `ll_fsync` |
+| `lustre/llite/vvp_io.c` | Periodic flush hook in `vvp_io_rw_end` (CIT_WRITE) |
 | `lustre/llite/llite_lib.c` | Persist + free on inode eviction in `ll_clear_inode` |
 | `lustre/llite/Makefile.in` | Add `dirty_blockmap.o` to the kernel module build |
 
@@ -53,13 +54,18 @@ least once. Block numbering starts at 0 (file bytes 0–2 GB).
 ```
 open()
   └─ ll_file_open()
-       └─ ll_dirty_blockmap_alloc()   if file >= 2 GB
-            └─ ll_dirty_blockmap_load()  restore from xattr if present
+       └─ ll_dirty_blockmap_alloc()   if file >= 2 GB at open time
+            (fresh zeroed bitmap — no xattr load)
 
 write()
   └─ ll_file_write_iter()
-       ├─ lazy alloc if file just crossed 2 GB threshold (handles dd O_TRUNC)
+       ├─ lazy alloc if no bitmap yet and (ki_pos >= 2 GB or
+       │  i_size_read() >= 2 GB) — handles dd O_TRUNC and writes
+       │  at low offsets into large sparse files
        └─ ll_dirty_blockmap_mark()    set bits for written byte range
+  └─ vvp_io_rw_end()  [CIT_WRITE, after each IO completion]
+       └─ ll_dirty_blockmap_store()   periodic flush if dbm_dirty
+            (same cadence as mtime updates — survives long-running opens)
 
 close()
   └─ ll_file_release()
@@ -82,18 +88,19 @@ inode eviction
 - `lli->lli_lock` is `rwlock_t` in 2.15.8 — use `write_lock`/`write_unlock` in
   `ll_dirty_blockmap_free()`, not `spin_lock`.
 - xattr I/O buffers are heap-allocated via `OBD_ALLOC`/`OBD_FREE` — the full bitmap
-  is 64 KB which exceeds the kernel stack limit of 2 KB.
-- `d_find_alias()`/`dput()` is used to obtain a dentry for `ll_vfs_setxattr` /
-  `ll_vfs_getxattr`, which require a dentry in addition to an inode.
+  is 64 KB which exceeds the kernel stack limit.
+- `md_setxattr()` requires a `struct ptlrpc_request **` — always pass `&req` and
+  call `ptlrpc_req_finished(req)` afterwards to free the MDS reply buffer.
 - The bitmap init in `ll_file_open()` is placed **before** the final
   `GOTO(out_och_free, rc)` on the success path. Placing it before the `out_och_free:`
   label itself would land in unreachable dead code.
 - `ll_file_write_iter()` uses `rc_normal` (not `result`). Write start offset is
   `iocb->ki_pos - rc_normal` because `ki_pos` has already advanced by the time
   the hook runs.
-- Lazy allocation in `ll_file_write_iter()` handles writers like `dd` that open
-  with `O_TRUNC` (file size is 0 at open time). The bitmap is allocated on the
-  first write where `iocb->ki_pos >= DIRTY_BLOCKMAP_MIN_FILESIZE`.
+- Lazy allocation in `ll_file_write_iter()` triggers when either
+  `iocb->ki_pos >= DIRTY_BLOCKMAP_MIN_FILESIZE` (file grew past threshold) or
+  `i_size_read() >= DIRTY_BLOCKMAP_MIN_FILESIZE` (write at any offset into a
+  large sparse file, e.g. `pwrite` at offset 0 on a 3 GB sparse file).
 
 ---
 
@@ -186,8 +193,10 @@ Block map:    01
 | Test | Expected | Result |
 |---|---|---|
 | `dd` (no fsync, `O_TRUNC`) into 3 GB file | 2 dirty blocks | ✅ |
+| `pwrite` at offset 0 into 3 GB sparse file | block 0 dirty (`10`) | ✅ |
 | `pwrite` at offset 2.5 GB only | block 1 dirty (`01`) | ✅ |
-| Bitmap persists across unmount/remount | same bitmap restored | ✅ |
+| OR merge: write block 0, reopen, write block 1 | both blocks dirty (`11`) | ✅ |
+| Read-only open+close | xattr unchanged | ✅ |
 | File < 2 GB | no xattr, no overhead | ✅ |
 
 ---
@@ -198,9 +207,13 @@ Block map:    01
   truncated. A future version should hook `ll_setattr` to zero stale bits.
 - **Block size is fixed** at compile time (2 GB). It is not encoded in the xattr,
   so the constant must match between the kernel module and any userspace reader.
-- **No concurrency hardening** beyond the per-bitmap spinlock. Concurrent writers
-  from multiple nodes are each tracked independently; the last `close()`/`fsync()`
-  to write the xattr wins.
+- **Concurrency**: the xattr update is a read-OR-write sequence with no distributed
+  lock. Lustre has no client-side `LCK_EX` path for `MDS_INODELOCK_XATTR`
+  (`IT_SETXATTR` is obsolete; ACL consistency relies on MDS-side serialization).
+  Two nodes flushing concurrently at `close()` or write commit can race — both read
+  the same xattr, both OR in their bits, and the last writer wins, potentially losing
+  the other node's bits. With 2 GB block granularity this window is very narrow in
+  practice. The consequence is a missed dirty block not data corruption or data loss.
 - Tested on **RHEL 9.7**, kernel `5.14.0-611.36.1.el9_7.x86_64`.
 
 ---
